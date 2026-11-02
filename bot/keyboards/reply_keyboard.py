@@ -7,4 +7,5 @@ def build_reply_keyboard(rows: list[list[dict[str, str]]]) -> ReplyKeyboardMarku
         keyboard=[[KeyboardButton(text=button['label']) for button in row] for row in rows],
         resize_keyboard=True,
         one_time_keyboard=False,
+        is_persistent=True,
     )
