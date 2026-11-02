@@ -1,0 +1,438 @@
+"""One closed transport contract for validation and OpenAPI 3.1 discovery."""
+from __future__ import annotations
+
+import json
+import re
+
+from core.results import CoreError
+from core.client_import import CLIENTS, MAX_TOKEN_LENGTH
+
+S, B, I, N = {'type': 'string'}, {'type': 'boolean'}, {'type': 'integer'}, {'type': 'number'}
+
+
+def obj(properties=None, required=None):
+    properties = properties or {}
+    return {'type': 'object', 'properties': properties, 'additionalProperties': False,
+            'required': list(properties) if required is None else required}
+
+
+def array(items):
+    return {'type': 'array', 'items': items}
+
+
+def nullable(schema):
+    return {'anyOf': [schema, {'type': 'null'}]}
+
+
+def ref(name):
+    return {'$ref': '#/components/schemas/' + name}
+
+
+def text_bound(size):
+    return {'type': 'string', 'maxLength': size}
+
+
+ID = {'type': 'integer', 'minimum': 1, 'maximum': 2**52 - 1}
+NS, NI = nullable(S), nullable(I)
+METHOD = obj({'id': S, 'presentation': S, 'label': S}, ['id', 'presentation'])
+PAGING = {'limit': I, 'offset': I}
+COMPOSITION = obj({'ok': B, 'status': S, 'binding_id': NI, 'applied': B, 'already_applied': B,
+                   'error_code': NS, 'host_count': I, 'host_key_id': I, 'operation_id': S}, ['ok', 'status'])
+PAYMENT_FIELDS = {'order_id': S, 'purpose': S, 'status': S, 'payment_type': NS, 'base_currency': S,
+                  'nominal_amount_minor': I, 'payable_amount_minor': I, 'balance_deduct_minor': I,
+                  'vpn_key_id': NI, 'period_days': NI, 'created_at': NS, 'paid_at': NS}
+SCHEMAS = {
+    'Error': obj({'code': S, 'details': {'type': 'object', 'additionalProperties': True},
+                  'retryable': B, 'operation_id': S}, ['code', 'details', 'retryable']),
+    'AuthSettings': obj({'phone_format': S, 'verification_available': B, 'verification_required': B,
+                         'verification_method': nullable({'type': 'string', 'enum': ['ucaller', 'smsaero_mobile', 'smsaero_sms']}),
+                         'password_recovery_available': B, 'unverified_phone_warning_required': B,
+                         'telegram_login_available': B}),
+    'PhoneVerification': obj({'challenge_id': S,
+        'method': {'type': 'string', 'enum': ['ucaller', 'smsaero_mobile', 'smsaero_sms']},
+        'state': {'type': 'string', 'enum': ['code_required', 'waiting', 'confirmed', 'failed', 'unknown', 'verified', 'expired']},
+        'send_state': {'type': 'string', 'enum': ['sent', 'failed', 'unknown']},
+        'expires_at': I, 'resend_at': I, 'code_length': NI, 'proof': NS}),
+    'Session': obj({'account_id': I, 'telegram_id': NI, 'source': S, 'expires_at': I, 'csrf': S},
+                   ['account_id', 'telegram_id', 'source', 'expires_at']),
+    'ModuleAvailability': obj({'module_id': S, 'version': S, 'api_version': I, 'state': S}),
+    'Bootstrap': obj({'api_version': I, 'auth': ref('AuthSettings'), 'modules': array(ref('ModuleAvailability')), 'features': obj({name: B for name in
+        ('subscriptions', 'trial', 'promotions', 'referrals', 'balance', 'subscription_import', 'support_chat')})}),
+    'Profile': obj({'account_id': I, 'telegram_id': NI, 'username': NS, 'first_name': NS, 'last_name': NS,
+        'account_name': NS, 'created_at': NS, 'credentials': obj({'present': B, 'phone': NS, 'phone_verified': B})},
+        ['account_id', 'telegram_id', 'username', 'first_name', 'last_name', 'created_at', 'credentials']),
+    'Catalog': obj({'purpose': S, 'subscription_id': NI,
+        'groups': array(obj({'id': I, 'name': S})),
+        'tariffs': array(obj({'id': I, 'name': S, 'group_id': I, 'duration_days': I, 'traffic_limit_gb': N,
+            'max_ips': I, 'base_currency': S, 'nominal_amount_minor': I, 'payable_amount_minor': I,
+            'payment_methods': array(METHOD), 'available': B, 'reason': NS}))}),
+    'TrialOffer': obj({'eligible': B, 'reason': NS, 'scope': S, 'offer': nullable(obj({
+        'offer_id': I, 'tariff_id': NI, 'is_primary': I, 'is_enabled': I, 'created_at': NS, 'updated_at': NS,
+        'resolved_tariff_id': NI, 'tariff_name': NS, 'duration_days': NI, 'traffic_limit_gb': nullable(N),
+        'max_ips': NI, 'tariff_is_active': NI, 'system_type': NS, 'group_id': NI, 'group_name': NS}))}),
+    'TrialResult': obj({'ok': B, 'reason': NS, 'operation_id': S, 'key_id': I, 'order_id': S, 'state': S,
+        'server_ids': array(I), 'composition': nullable(COMPOSITION), 'scope': NS}, ['ok', 'operation_id']),
+    'KeyResult': obj({'operation_id': S, 'key_id': I, 'state': S, 'deleted': B, 'reason': S, 'error': S,
+        'composition': COMPOSITION}, ['operation_id']),
+    'KeyOperation': obj({'operation_id': S, 'kind': S, 'key_id': I, 'state': S,
+        'result': nullable(obj({'key_id': I, 'state': S, 'deleted': B, 'reason': S, 'error': S,
+            'composition': COMPOSITION}, []))}),
+    'Subscription': obj({'id': I, 'name': NS, 'tariff_id': I, 'tariff_name': NS,
+        'server_id': NI, 'server_name': NS, 'expires_at': NS, 'created_at': NS, 'state': S, 'access_status': S,
+        'traffic': obj({'used_bytes': NI, 'limit_bytes': NI, 'known': B, 'updated_at': NS, 'source': S}),
+        'devices_available': B, 'actions': obj({name: obj({'allowed': B, 'reason': NS}) for name in
+            ('key.rename.start', 'key.renew.start', 'key.delete', 'key.configure.start', 'key.replace.start')}),
+        'pending_operations': array(obj({'id': S, 'kind': S, 'created_at': I})),
+        'servers': array(obj({'id': I, 'name': S}))}),
+    'KeyHistoryItem': obj({'id': S, 'kind': S, 'action': S, 'source': NS, 'status': S,
+        'payable_amount_minor': NI, 'currency': NS, 'delta_days': NI, 'expires_before': NS, 'expires_after': NS, 'created_at': NS}),
+    'Device': obj({'id': S, 'first_seen': NI, 'last_seen': NI, 'user_agent': S,
+                   'device_os': S, 'os_version': S, 'device_model': S}),
+    'Host': obj({'id': I, 'custom_name': NS, 'tariff_name': NS, 'server_name': NS, 'expires_at': NS}),
+    'Import': obj({'state': {'enum': ['select_group', 'pending', 'completed']}, 'key_ids': array(I),
+                   'groups': array(obj({'id': I, 'name': S}))}),
+    'Quote': obj({'quote_id': S, 'expires_at': I, 'version': I, 'purpose': S, 'tariff_id': NI, 'key_id': NI,
+        'payment_type': S, 'base_currency': S, 'nominal_amount_minor': I, 'payable_amount_minor': I,
+        'charge_minor': I, 'charge_currency': S, 'balance_deduct_minor': I, 'duration_days': NI,
+        'traffic_limit_gb': nullable(N), 'max_ips': NI}),
+    'Order': obj({'order_id': S, 'operation_id': NS, 'purpose': S, 'status': S, 'fulfillment_status': S,
+        'provider_confirmed': B, 'can_check': B, 'provider_status': NS, 'payment_type': NS, 'base_currency': S,
+        'nominal_amount_minor': I, 'payable_amount_minor': I, 'balance_deduct_minor': I,
+        'charge_amount': NS, 'charge_currency': NS, 'subscription_id': NI, 'access_status': NS,
+        'payment_url': NS, 'presentation': S}, ['order_id', 'status', 'purpose', 'fulfillment_status', 'provider_confirmed',
+            'base_currency', 'nominal_amount_minor', 'payable_amount_minor', 'balance_deduct_minor', 'access_status']),
+    'Balance': obj({'amount_minor': I, 'currency': S, 'spending_enabled': B, **PAGING,
+        'history': array(obj({'id': I, 'operation_type': S, 'delta_minor': I, 'currency': S,
+            'balance_before': I, 'balance_after': I, 'reason': NS, 'created_at': NS}))}),
+    'Promo': obj({'ok': B, 'reason': NS, 'operation_id': S,
+        'promo': obj({'code': S, 'type': S, 'discount_percent': I, 'expires_at': NS})}, ['ok']),
+    'Referrals': obj({'enabled': B, 'code': S, 'reward_type': S, 'site_url': NS, 'telegram_url': NS,
+        'levels': array(obj({'level_number': I, 'percent': I, 'enabled': I})),
+        'statistics': array(obj({'level': I, 'paying_count': I, 'total_reward_cents': I, 'total_reward_minor': I,
+            'reward_currency': NS, 'total_reward_days': I, 'count': I})), 'coefficient': N, 'conditions_html': S}, ['enabled']),
+    'Help': obj({'content_html': S, 'links': array(obj({'label': NS, 'url': S}))}),
+}
+
+
+def page(item):
+    return obj({'items': array(item), **PAGING})
+
+
+SCHEMAS['UiSettings'] = obj({'title': S, 'logo': NS, 'preset': S, 'theme': S,
+                           'sync_interval_seconds': I})
+SCHEMAS['UiPreview'] = obj({'settings': ref('UiSettings'), 'captured_at': I, 'currency': S,
+    'modules': array(ref('ModuleAvailability')),
+    'features': SCHEMAS['Bootstrap']['properties']['features'],
+    'tariffs': array(obj({'id': I, 'name': S, 'group_id': I, 'duration_days': I,
+                          'price_minor': I, 'traffic_limit_gb': N, 'max_ips': I})),
+    'trial_offers': array(obj({'offer_id': I, 'tariff_name': NS, 'duration_days': NI,
+                              'traffic_limit_gb': nullable(N)}))})
+
+
+# method, path, input, output, anonymous, durable-idempotency-header
+ROUTES = []
+
+SCHEMAS['EditorViewed'] = obj({'contract_version': {'type': 'integer', 'enum': [1]},
+    'route': text_bound(210), 'scenario': text_bound(80), 'preset': text_bound(32),
+    'theme': text_bound(32), 'ui_version': text_bound(32), 'customization_version': text_bound(128)})
+EDITOR_REQUEST_ID = {'anyOf': [ID, {'type': 'string', 'minLength': 1, 'maxLength': 19,
+    'description': 'Exact decimal Hub ID when outside the legacy numeric range; treat as opaque.'}]}
+SCHEMAS['EditorFinal'] = obj({'content': S, 'content_html': S, 'viewer_url': nullable(S),
+    'request_id': nullable(EDITOR_REQUEST_ID), 'rich_markdown': nullable(S)},
+    ['content', 'viewer_url', 'request_id', 'rich_markdown'])
+SCHEMAS['EditorProgress'] = obj({'event': S, 'content': S, 'slot': S, 'cancel_button_text': nullable(S)})
+SCHEMAS['EditorLatest'] = obj({'request_id': EDITOR_REQUEST_ID, 'event': S, 'final': nullable(ref('EditorFinal')),
+    'progress': nullable(ref('EditorProgress')), 'resume_allowed': B, 'cancel_button_text': nullable(S)})
+SCHEMAS['EditorState'] = obj({'task': nullable(obj({'task_id': S, 'viewed': ref('EditorViewed')})),
+    'latest': nullable(ref('EditorLatest')), 'local_polling': B})
+SCHEMAS['EditorCandidate'] = obj({'build_id': S, 'base_build_id': S, 'content_hash': S,
+    'customization_version': S, 'revision': S, 'package_sha256': S,
+    'package_valid': {'type': 'boolean', 'enum': [True]}, 'activated': {'type': 'boolean', 'enum': [False]}})
+
+
+def route(method, path, output, inputs=None, *, anonymous=False, idempotent=False, paging=False, query=None,
+          media_type='application/json'):
+    ROUTES.append({'method': method, 'path': '/api/v1/' + path, 'input': inputs, 'output': output,
+        'anonymous': anonymous, 'idempotent': idempotent, 'media_type': media_type, 'query': query or ({
+            'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100},
+            'offset': {'type': 'integer', 'minimum': 0, 'maximum': 1000000}} if paging else {})})
+
+
+route('GET', 'bootstrap', ref('Bootstrap'), anonymous=True)
+route('GET', 'ui/settings', ref('UiSettings'), anonymous=True)
+UI_API_RANGE = obj({'min': I, 'max': I})
+UI_MANIFEST_FIELDS = {'product': S, 'product_version': S, 'base_build_id': S, 'build_id': S,
+    'instance_id': S, 'core_api': UI_API_RANGE, 'environment_contract': I,
+    'customization_version': S, 'key_id': S, 'content_hash': S,
+    'files': {'type': 'object', 'additionalProperties': obj({'sha256': S, 'size': I})}}
+UI_REQUIREMENTS = obj({'frontend_api': UI_API_RANGE, 'modules': array(obj({'id': S, 'version': S,
+    'api_version': I, 'core_api': UI_API_RANGE, 'frontend_api': UI_API_RANGE, 'environment_contract': I}))})
+route('GET', 'ui/manifest', obj({'manifest': {'anyOf': [
+    obj({**UI_MANIFEST_FIELDS, 'format_version': {'type': 'integer', 'enum': [3]}, 'requirements': UI_REQUIREMENTS}),
+]}, 'signature': S}), anonymous=True)
+route('GET', 'ui/packages/{content_hash}', {'type': 'string', 'format': 'binary'}, anonymous=True)
+route('GET', 'admin/ui/preview', ref('UiPreview'))
+route('POST', 'admin/ui/preset', ref('UiSettings'), obj({'preset': text_bound(32)}))
+route('GET', 'admin/ui/editor', ref('EditorState'))
+route('POST', 'admin/ui/editor/preview', obj({'task_id': S, 'candidate': ref('EditorCandidate'),
+    'viewed': ref('EditorViewed'), 'preview_url': S, 'published': B,
+    'pages': array(obj({'id': S, 'title': nullable(S), 'preview_parameter': S}, required=['id']))}), obj())
+route('POST', 'admin/ui/editor/apply', obj({'current_build_id': S, 'changed': B}),
+    obj({'task_id': text_bound(32), 'build_id': text_bound(32)}))
+route('POST', 'admin/ui/editor/turns', obj({'status': {'type': 'string', 'enum': ['accepted']},
+    'task_id': S, 'request_id': EDITOR_REQUEST_ID}), obj({'message': text_bound(8192), 'viewed': ref('EditorViewed')}))
+route('POST', 'admin/ui/editor/uploads', obj({'status': {'type': 'string', 'enum': ['accepted']},
+    'task_id': S, 'request_id': EDITOR_REQUEST_ID}), obj({'message': text_bound(8192),
+    'viewed': {**S, 'description': 'JSON-encoded EditorViewed; validated with the same closed schema.'},
+    'files': {'type': 'array', 'maxItems': 5, 'items': {'type': 'string', 'format': 'binary'},
+              'description': 'At least one attachment required. Up to five files including voice, 10 MiB each; body up to 50 MiB + 64 KiB.'},
+    'voice': {'type': 'string', 'format': 'binary', 'description': 'One OGG/WAV spoken request; counts as one file.'},
+    'file': {'type': 'string', 'format': 'binary', 'description': 'Legacy alias of voice; cannot be combined with voice.'}},
+    required=['message', 'viewed']),
+    media_type='multipart/form-data')
+route('POST', 'admin/ui/editor/resume', obj({'resuming': B}), obj())
+route('POST', 'admin/ui/editor/cancel', obj({'status': S, 'response_text': S, 'cancel_button_text': nullable(S),
+    'request_id': nullable(EDITOR_REQUEST_ID), 'retry_after_sec': nullable(N)}), obj())
+route('POST', 'admin/ui/editor/new-chat', obj({'status': S, 'response_text': S, 'cancel_button_text': nullable(S),
+    'closed_session_id': {'anyOf': [S, I, {'type': 'null'}]}}), obj())
+route('GET', 'auth/settings', ref('AuthSettings'), anonymous=True)
+route('POST', 'auth/register', ref('Session'), obj({'phone': text_bound(64), 'password': text_bound(128),
+    'proof': nullable(text_bound(128)), 'referral_code': nullable(text_bound(128))}, ['phone', 'password']), anonymous=True)
+route('POST', 'auth/login', ref('Session'), obj({'phone': text_bound(64), 'password': text_bound(128)}), anonymous=True)
+route('POST', 'auth/telegram', ref('Session'), obj({'init_data': text_bound(8192)}), anonymous=True)
+route('POST', 'auth/telegram/web/start', obj({'client_id': ID, 'nonce': S, 'expires_at': I}), obj(), anonymous=True)
+route('POST', 'auth/telegram/web/finish', ref('Session'), obj({'id_token': text_bound(16384)}), anonymous=True)
+route('POST', 'auth/logout', obj({'logged_out': B}), obj())
+route('GET', 'auth/session', ref('Session'))
+route('POST', 'account/credentials', ref('Session'), obj({'phone': text_bound(64), 'password': text_bound(128),
+    'current_password': nullable(text_bound(128)), 'proof': nullable(text_bound(128))}, ['phone', 'password']))
+route('POST', 'auth/verification/request', ref('PhoneVerification'),
+    obj({'phone': text_bound(64), 'purpose': {'type': 'string', 'enum': ['register', 'credentials', 'reset']}}), anonymous=True)
+route('POST', 'auth/verification/status', ref('PhoneVerification'), obj({'challenge_id': text_bound(64)}), anonymous=True)
+route('POST', 'auth/verification/verify', ref('PhoneVerification'),
+    obj({'challenge_id': text_bound(64), 'code': nullable(text_bound(32))}, ['challenge_id']), anonymous=True)
+route('POST', 'auth/password/reset', obj({'password_reset': B}),
+    obj({'phone': text_bound(64), 'password': text_bound(128), 'proof': text_bound(128)}), anonymous=True)
+route('POST', 'account/telegram/link', obj({'token': S, 'telegram_url': S, 'expires_at': I}), obj())
+route('POST', 'account/telegram/link/status', obj({'state': S, 'expires_at': I, 'telegram_id': NI,
+    'username': NS, 'first_name': NS, 'last_name': NS, 'account_id': I, 'target_account_id': I,
+    'phone': NS, 'merge': B}), obj({'token': text_bound(64)}))
+route('POST', 'account/telegram/link/finish', obj({'account_id': I, 'telegram_id': I, 'pending_renames': I, 'session': ref('Session')}),
+    obj({'token': text_bound(64), 'telegram_id': ID}))
+route('GET', 'me', ref('Profile'))
+route('GET', 'catalog', ref('Catalog'), query={'subscription_id': ID})
+route('GET', 'trial-offers', obj({'offers': array(ref('TrialOffer'))}))
+route('POST', 'trials/{id}/activate', ref('TrialResult'), obj(), idempotent=True)
+route('GET', 'subscriptions', page(ref('Subscription')), paging=True)
+route('GET', 'subscriptions/{id}', ref('Subscription'))
+route('GET', 'subscriptions/{id}/history', page(ref('KeyHistoryItem')), paging=True)
+route('GET', 'subscriptions/{id}/access', obj({'subscription_id': I, 'url': S, 'client_import_url': S}, ['subscription_id', 'url']))
+route('POST', 'client-import/resolve', obj({'client_name': S, 'uri': S, 'url': S}),
+      obj({'token': text_bound(MAX_TOKEN_LENGTH), 'client': {'type': 'string', 'enum': list(CLIENTS)}}), anonymous=True)
+route('GET', 'subscriptions/{id}/devices', obj({'devices': array(ref('Device'))}))
+route('GET', 'subscriptions/{id}/host-candidates', obj({'hosts': array(ref('Host'))}))
+for action, fields in [('configure', {'server_id': ID}), ('replace', {'server_id': ID}),
+                       ('rename', {'name': {'type': 'string', 'minLength': 1, 'maxLength': 30}}), ('delete', {})]:
+    route('POST', 'subscriptions/{id}/' + action, ref('KeyResult'), obj(fields), idempotent=True)
+route('POST', 'subscriptions/{id}/devices/{device}/delete', ref('KeyResult'), obj(), idempotent=True)
+route('POST', 'subscriptions/{id}/host', COMPOSITION, obj({'host_id': ID}), idempotent=True)
+route('GET', 'key-operations/{id}', ref('KeyOperation'))
+route('POST', 'subscription-imports', ref('Import'), obj({'url': text_bound(2048), 'group_id': ID}, ['url']))
+route('POST', 'quotes', ref('Quote'), obj({'purpose': {'type': 'string', 'enum': ['key_purchase', 'key_renewal', 'balance_topup']},
+    'payment_type': text_bound(128), 'tariff_id': nullable(ID), 'key_id': nullable(ID),
+    'nominal_amount_minor': nullable(ID), 'use_balance': B}, ['purpose', 'payment_type']))
+route('POST', 'orders', ref('Order'), obj({'quote_id': text_bound(128)}), idempotent=True)
+route('GET', 'orders/{id}', ref('Order'))
+route('POST', 'orders/{id}/method', ref('Order'), obj({'payment_type': text_bound(128)}))
+for action in ('check', 'cancel'):
+    route('POST', 'orders/{id}/' + action, ref('Order'), obj())
+route('GET', 'balance', ref('Balance'), paging=True)
+route('POST', 'balance/topups', ref('Order'), obj({'quote_id': text_bound(128)}), idempotent=True)
+route('GET', 'payments', page(obj(PAYMENT_FIELDS)), paging=True)
+for action in ('check', 'activate', 'clear'):
+    route('POST', 'promotions/' + action, ref('Promo'), obj({'code': text_bound(128)} if action != 'clear' else {}),
+          idempotent=action != 'check')
+route('GET', 'referrals', ref('Referrals'))
+route('POST', 'referrals/attribute', obj({'attributed': B}), obj({'code': text_bound(128)}))
+route('GET', 'help', ref('Help'))
+route('POST', 'modules/{module_id}/operations/{name}', obj({'operation_id': S, 'result': {}}),
+    {'type': 'object', 'additionalProperties': True}, idempotent=True)
+ROUTES[-1]['description'] = (
+    'Completed commands replay the saved result for 30 days after completion; changed inputs conflict. '
+    'Maintenance then deletes the entire receipt. Reusing its key after deletion starts a new command. '
+    'Pending commands retain their identity. Long-lived financial effects require their own stable business key; '
+    'an HTTP operation_id is not a permanent purchase identity. The SDK never retries commands automatically.')
+route('GET', 'modules/{module_id}/support/attachments/{message_id}', {'type': 'string', 'format': 'binary'})
+route('POST', 'modules/{module_id}/files', obj({'file_id': S, 'filename': S, 'content_type': S,
+    'size': I, 'persistent': B, 'expires_at': nullable(I)}), obj({'file': {'type': 'string', 'format': 'binary'}}),
+    media_type='multipart/form-data')
+route('GET', 'modules/{module_id}/files/{file_id}', {'type': 'string', 'format': 'binary'})
+route('GET', 'modules/{module_id}/queries/{name}', obj({'result': {}}))
+ROUTES[-1]['query'] = {'inputs': text_bound(65536)}
+route('GET', 'modules/{module_id}/operations/{operation_id}', obj({
+    'operation_id': S, 'state': {'type': 'string', 'enum': ['pending', 'completed', 'result_expired']},
+    'result': {}, 'error_code': nullable(S)}))
+ROUTES[-1]['description'] = (
+    'Read status without running the handler. A deleted receipt returns 404 operation_not_found; '
+    'absence does not prove that the action was never executed. Legacy result_expired records remain readable '
+    'until cleanup; new completed receipts are deleted in full after 30 days.')
+for entry in ROUTES:
+    entry['pattern'] = re.compile(re.sub(r'\{[^}]+\}', '[^/]+', entry['path']) + r'\Z')
+
+
+def contract(request):
+    method = 'GET' if request.method == 'HEAD' else request.method
+    return next((item for item in ROUTES if item['method'] == method and item['pattern'].fullmatch(request.path)), None)
+
+
+def validate(value, schema, path='$'):
+    """Validate the subset emitted above; custom operation schemas also validate in core."""
+    if '$ref' in schema:
+        return validate(value, SCHEMAS[schema['$ref'].rsplit('/', 1)[1]], path)
+    if 'anyOf' in schema:
+        for choice in schema['anyOf']:
+            try:
+                validate(value, choice, path)
+                return
+            except ValueError:
+                pass
+        raise ValueError(path)
+    kind = schema.get('type')
+    types = {'string': str, 'boolean': bool, 'integer': int, 'object': dict, 'array': list, 'null': type(None)}
+    if kind == 'number':
+        if type(value) not in (int, float) or not -2**53 <= value <= 2**53:
+            raise ValueError(path)
+    elif kind and type(value) is not types[kind]:
+        raise ValueError(path)
+    if 'enum' in schema and value not in schema['enum']:
+        raise ValueError(path)
+    if kind == 'object':
+        properties = schema.get('properties', {})
+        if set(schema.get('required', [])) - set(value):
+            raise ValueError(path)
+        for key, child in value.items():
+            if key in properties:
+                validate(child, properties[key], path + '.' + key)
+            elif schema.get('additionalProperties') is False:
+                raise ValueError(path + '.' + key)
+    elif kind == 'array':
+        for child in value:
+            validate(child, schema['items'], path + '[]')
+    elif kind == 'string':
+        if not schema.get('minLength', 0) <= len(value) <= schema.get('maxLength', float('inf')):
+            raise ValueError(path)
+    elif kind in ('number', 'integer'):
+        if not schema.get('minimum', -2**53) <= value <= schema.get('maximum', 2**53):
+            raise ValueError(path)
+
+
+async def validate_request(request):
+    entry = contract(request)
+    if not entry:
+        return
+    try:
+        if set(request.query) - set(entry['query']) or any(len(request.query.getall(key)) != 1 for key in request.query):
+            raise ValueError('query')
+        for key, value in request.query.items():
+            validate(int(value) if entry['query'][key].get('type') == 'integer' else value, entry['query'][key], key)
+        if entry['idempotent'] and not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', request.headers.get('Idempotency-Key', '')):
+            raise ValueError('Idempotency-Key')
+        if entry['input'] is not None and entry['media_type'] == 'application/json':
+            validate(await request.json(), entry['input'])
+    except (ValueError, TypeError, OverflowError) as error:
+        raise CoreError('invalid_request', details={'field': str(error)[:128]}) from None
+
+
+def validate_response(request, response):
+    entry = contract(request)
+    if entry and response.status < 400 and response.content_type == 'application/json':
+        try:
+            validate(json.loads(response.body), entry['output'])
+        except (ValueError, TypeError, KeyError):
+            raise CoreError('invalid_response', retryable=True) from None
+
+
+def openapi_document():
+    from copy import deepcopy
+    paths = {}
+    components = deepcopy(SCHEMAS)
+    def model_schema(policy, field, module_id, name):
+        schema = policy[field + '_schema']
+        if policy.get('schema_format') != 'pydantic':
+            return schema
+        identity = f'module_{module_id}_{name}_{field}'
+        prefix = '#/components/schemas/' + identity
+        def relocate(value):
+            if isinstance(value, list):
+                return [relocate(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            return {key: prefix + item[1:] if key == '$ref' and isinstance(item, str) and item.startswith('#/')
+                    else relocate(item) for key, item in value.items()}
+        components[identity] = relocate(schema)
+        return ref(identity)
+    for entry in ROUTES:
+        parameters = [{'name': name, 'in': 'path', 'required': True, 'schema': text_bound(128)}
+                      for name in re.findall(r'\{([^}]+)\}', entry['path'])]
+        parameters += [{'name': name, 'in': 'query', 'required': False, 'schema': schema} for name, schema in entry['query'].items()]
+        if entry['method'] == 'POST':
+            parameters += [{'name': 'Origin', 'in': 'header', 'required': True, 'schema': S},
+                           {'name': 'X-CSRF-Token', 'in': 'header', 'required': not entry['anonymous'], 'schema': S,
+                            'description': 'Required whenever a valid session cookie is sent, including anonymous auth endpoints.'}]
+        if entry['idempotent']:
+            parameters.append({'name': 'Idempotency-Key', 'in': 'header', 'required': True, 'schema': text_bound(128)})
+        binary = entry['output'].get('format') == 'binary'
+        operation = {'operationId': entry['method'].lower() + '_' + re.sub(r'[^a-zA-Z0-9]+', '_', entry['path']).strip('_'),
+            'security': [] if entry['anonymous'] else [{'SessionCookie': []}], 'parameters': parameters,
+            'responses': {'200': {'description': 'Successful own-account result. Sensitive responses are never cached.',
+                'content': {'application/octet-stream' if binary else 'application/json': {'schema': entry['output']}}},
+                **{str(code): {'description': description, 'content': {'application/json': {'schema': ref('Error')}}}
+                   for code, description in ((400, 'Domain rejection'), (401, 'Authentication required'), (403, 'Origin, CSRF or access denied'),
+                       (404, 'Resource unavailable to this account'), (405, 'Method not allowed'),
+                       (409, 'Conflict or unavailable action'), (410, 'Result or temporary file no longer retained'),
+                       (413, 'Request body too large'), (422, 'Invalid input'),
+                       (429, 'Rate limited'), (500, 'Internal failure'), (503, 'Retryable operation or unavailable service'))}}}
+        if 'description' in entry:
+            operation['description'] = entry['description']
+        if entry['input'] is not None:
+            operation['requestBody'] = {'required': True, 'content': {entry['media_type']: {'schema': entry['input']}}}
+        paths.setdefault(entry['path'], {})[entry['method'].lower()] = operation
+    from core.extensions.registry import POLICIES
+    for (kind, module_id, name), policy in POLICIES.items():
+        if kind == 'webhook':
+            paths[policy['path']] = {'post': {'operationId': f'webhook_{module_id}_{name}', 'security': [],
+                'description': 'Integration verifier checks raw bytes and headers. ACK follows an atomic event/task commit. '
+                               'User identity comes from a saved server reference, never a body user_id.',
+                'requestBody': {'required': True, 'content': {'application/octet-stream': {'schema': {'type': 'string', 'format': 'binary'}}}},
+                'responses': {'200': {'description': 'Durably accepted or duplicate event'},
+                              '403': {'description': 'Signature rejected'}, '503': {'description': 'Not accepted; retry delivery'}}}}
+        if kind == 'user_operation':
+            input_schema = model_schema(policy, 'input', module_id, name)
+            result_schema = model_schema(policy, 'result', module_id, name)
+            if policy.get('operation_kind') == 'query':
+                base_responses = paths['/api/v1/modules/{module_id}/queries/{name}']['get']['responses']
+                paths[f'/api/v1/modules/{module_id}/queries/{name}'] = {'get': {
+                    **paths['/api/v1/modules/{module_id}/queries/{name}']['get'],
+                    'operationId': f'query_{module_id}_{name}',
+                    'parameters': [{'name': 'inputs', 'in': 'query', 'required': False,
+                                    'content': {'application/json': {'schema': input_schema}}}],
+                    'responses': {**base_responses, '200': {'description': 'Read-only module result', 'content': {'application/json': {
+                        'schema': obj({'result': result_schema})}}}}}}
+                continue
+            # Public declarations only: no handlers, settings, policy inputs or secrets.
+            paths[f'/api/v1/modules/{module_id}/operations/{name}'] = {'post': {
+                **paths['/api/v1/modules/{module_id}/operations/{name}']['post'],
+                'operationId': f'module_{module_id}_{name}',
+                'parameters': [value for value in paths['/api/v1/modules/{module_id}/operations/{name}']['post']['parameters'] if value['in'] != 'path'],
+                'requestBody': {'required': True, 'content': {'application/json': {'schema': input_schema}}},
+                'responses': {**paths['/api/v1/modules/{module_id}/operations/{name}']['post']['responses'],
+                    '200': {'description': 'Schema-validated module result', 'content': {'application/json': {
+                    'schema': obj({'operation_id': S, 'result': result_schema})}}}}}}
+    return {'openapi': '3.1.0', 'info': {'title': 'YadrenoVPN Account API', 'version': '1.0.0'},
+        'servers': [{'url': '/'}], 'paths': paths, 'components': {'schemas': components,
+        'securitySchemes': {'SessionCookie': {'type': 'apiKey', 'in': 'cookie', 'name': '__Host-yadreno_session'}}}}
+
+
+async def openapi(request):
+    from aiohttp import web
+    return web.json_response(openapi_document())

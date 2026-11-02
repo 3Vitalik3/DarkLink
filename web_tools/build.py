@@ -1,0 +1,228 @@
+"""Local staged builds: custom sources are never copied over core source files."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import shutil
+import subprocess
+import uuid
+from pathlib import Path
+
+from web_tools.package import create_package, verify_package, signing_identity, digest
+from web_tools.paths import CUSTOM_SOURCE_IGNORED, atomic_write, canonical, local_path
+from web_tools.publication import publication_lock
+from web_tools.view_inventory import write_source_provenance
+from web_tools.errors import WebSourceError, WebPlatformError
+from web_tools.permissions import require_permissions
+
+
+def admin_directory(path):
+    path = Path(path)
+    for ancestor in (path, *path.parents):
+        if ancestor.is_symlink():
+            raise ValueError('build paths must not contain symlinks')
+    if path.exists():
+        require_permissions(path, message='build directory must be owned by the invoking administrator and not writable by others')
+    return path.resolve()
+
+
+def source_version(root, *, include_commit=True):
+    root = Path(root)
+    source = hashlib.sha256()
+    web = local_path(root, 'web')
+    root = web.parent
+    names = []
+    # Validate directories before walking them and every input before reading
+    # any content. rglob/is_file alone can follow an escaped source symlink.
+    for source_name in ('src', 'public', 'platform'):
+        sources = local_path(root, 'web/' + source_name)
+        if sources.exists():
+            if not sources.is_dir():
+                raise ValueError('frontend source root must be a directory')
+            for directory, subdirs, files in os.walk(sources, followlinks=False):
+                for name in subdirs:
+                    local_path(root, (Path(directory) / name).relative_to(root).as_posix(), hidden=True)
+                names.extend(Path(directory) / name for name in files)
+    names.extend(web / item for item in ('package.json', 'package-lock.json', 'vite.app.config.ts', 'vite.platform.config.ts', 'customization.mjs', 'manifest.json'))
+    names.extend(web.glob('tsconfig*.json'))
+    names.extend(root / 'web_tools' / item for item in ('service_worker.js', 'compatibility.json', 'toolchain.json'))
+    inputs = []
+    # Path ordering differs between Windows (case-folded) and POSIX. The shipped
+    # source identity uses one explicit portable relative-name order.
+    for file in sorted(names, key=lambda file: file.relative_to(root).as_posix()):
+        checked = local_path(root, file.relative_to(root).as_posix(), hidden=True)
+        if not checked.exists():
+            continue
+        info = checked.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError('frontend sources must be local regular files without hardlinks')
+        inputs.append(checked)
+    for file in inputs:
+        content = file.read_bytes()
+        if file.suffix in {'.ts', '.tsx', '.js', '.mjs', '.css', '.json', '.html', '.svg'}:
+            content = content.replace(b'\r\n', b'\n')
+        source.update(file.relative_to(root).as_posix().encode()); source.update(content)
+    if not include_commit:
+        return source.hexdigest(), 'unversioned-local-source'
+    git = shutil.which('git')
+    commit = ''
+    if git:
+        top = subprocess.run([git, '-C', str(root), 'rev-parse', '--show-toplevel'], capture_output=True, text=True).stdout.strip()
+        if top and Path(top).resolve() == root.resolve():
+            commit = subprocess.run([git, '-C', str(root), 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
+            status = subprocess.run([git, '-C', str(root), 'status', '--porcelain', '--untracked-files=all', '--',
+                                     *[file.relative_to(root).as_posix() for file in inputs]],
+                                    capture_output=True, text=True).stdout.strip()
+            if commit and status:
+                commit += '-worktree.' + source.hexdigest()[:16]
+    return source.hexdigest(), commit or 'unversioned-local-source'
+
+
+def custom_inventory_fingerprint(inventory):
+    """Hash the canonical source inventory shared by bounded workspace scans."""
+    return digest(canonical(inventory))
+
+
+def custom_source_fingerprint(custom, *, copy_to=None):
+    """Fingerprint all local custom inputs, optionally making a private copy."""
+    custom = admin_directory(custom)
+    if not custom.exists():
+        return None
+    if not custom.is_dir():
+        raise ValueError('custom UI source must be a directory')
+    inventory = {}
+    for path in sorted(custom.rglob('*')):
+        if any(part in CUSTOM_SOURCE_IGNORED for part in path.relative_to(custom).parts):
+            continue
+        name = path.relative_to(custom).as_posix()
+        if any(parent.is_symlink() for parent in (path, *path.parents)) or not path.resolve().is_relative_to(custom):
+            raise ValueError('custom UI sources must not contain symbolic links')
+        checked = path
+        info = checked.stat()
+        require_permissions(checked, info, message='custom UI sources must be administrator-owned and not writable by others')
+        if checked.is_dir():
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError('custom UI sources must be regular files without hardlinks')
+        content = checked.read_bytes()
+        inventory[name] = {'sha256': digest(content), 'size': len(content)}
+        if copy_to is not None:
+            target = admin_directory(copy_to) / path.relative_to(custom)
+            if any(parent.is_symlink() for parent in (target, *target.parents)):
+                raise ValueError('custom UI copy must not contain symbolic links')
+            atomic_write(target, content)
+    return custom_inventory_fingerprint(inventory)
+
+
+def require_toolchain(root):
+    """Only source compilation needs Node; installation of prepared assets does not."""
+    if local_path(root, 'web_tools/toolchain.json').is_file():
+        from web_tools.toolchain import resolve
+        return resolve(root)
+    node, npm = shutil.which('node'), shutil.which('npm')
+    if not node or not npm:
+        raise ValueError('Node.js and npm are required for local UI builds')
+    web = root / 'web'
+    if not (web / 'node_modules' / '.bin' / ('vite.cmd' if os.name == 'nt' else 'vite')).is_file():
+        raise ValueError('install pinned web dependencies with npm ci before building')
+    return node, npm
+
+
+def compile_files(root, runtime, custom, stage, *, build_id, instance_id, toolchain=None, run=None, customization_version=None):
+    """Compile the same frontend for local customs and portable base distribution."""
+    run = subprocess.run if run is None else run
+    node, npm = toolchain or require_toolchain(root)
+    web = root / 'web'
+    for name in ('package.json', 'package-lock.json', 'vite.app.config.ts', 'customization.mjs', 'tsconfig.json'):
+        if not (web / name).is_file():
+            raise WebPlatformError('Installed compiler input is missing: web/' + name)
+    env = {**os.environ, 'YADRENO_CUSTOM_WEB': str(custom), 'YADRENO_UI_OUT': str(stage / 'files'),
+           'YADRENO_VITE_CACHE': str(local_path(runtime, 'cache', directory=True)), 'YADRENO_UI_BUILD': build_id,
+           'YADRENO_UI_BASE': '/ui/versions/' + build_id + '/', 'YADRENO_UI_INSTANCE': instance_id,
+           'NODE_OPTIONS': '--max-old-space-size=512'}
+    env['PATH'] = str(Path(node).parent) + os.pathsep + env.get('PATH', os.defpath)
+    if customization_version is not None or custom == web:
+        env['YADRENO_UI_CUSTOMIZATION'] = customization_version or 'base'
+    declaration = run([node, '--input-type=module', '-e',
+        "import {readCustomization} from './customization.mjs'; console.log(JSON.stringify(readCustomization(process.env.YADRENO_CUSTOM_WEB)));"],
+        cwd=web, env=env, capture_output=True, text=True, timeout=180)
+    if declaration.returncode:
+        if 'UI compiler isolation is unavailable' in declaration.stderr:
+            raise WebPlatformError('The installed compiler isolation check failed.')
+        raise WebSourceError('web_project_invalid', 'Project metadata validation failed: ' + declaration.stderr.strip()[-4000:], file='manifest.json')
+    customization = json.loads(declaration.stdout)
+    from web_tools.compatibility import check_requirements
+    try:
+        check_requirements(customization['requirements'])
+    except ValueError as error:
+        raise WebSourceError('web_project_invalid', str(error), file='manifest.json',
+                             next_action='Correct module compatibility metadata in the working manifest, then run web.build.') from error
+    if 'YADRENO_UI_CUSTOMIZATION' in env:
+        customization['version'] = env['YADRENO_UI_CUSTOMIZATION']
+    # The type checker and Vite consume exactly one complete source tree.
+    paths = json.loads((web / 'tsconfig.json').read_bytes())['compilerOptions']['paths']
+    paths = {key: [str((web / value).resolve()) for value in values] for key, values in paths.items()}
+    paths['@ui/*'] = [str(custom / 'src' / '*')]
+    for alias, name in {'context': 'runtime/context.tsx', 'client': 'api/client.ts', 'contracts': 'api/contracts.ts',
+                        'environment': 'runtime/environment.ts', 'storage': 'runtime/application-storage.ts'}.items():
+        paths['@ui/' + alias] = [str(web / 'platform' / name)]
+    paths['@application/*'] = [str(custom / 'src' / '*')]
+    # Stock web/ also contains Node-only build configs, outside its UI source tree.
+    typecheck_root = custom / 'src' if custom == web else custom
+    tsconfig = {'extends': str(web / 'tsconfig.json'),
+                'compilerOptions': {'paths': paths, 'types': [], 'typeRoots': [str(web / 'node_modules/@types')]},
+                'include': [str(web / 'node_modules/vite/client.d.ts'),
+                            str(web / 'platform/app-entry.tsx'), str(typecheck_root / '**' / '*.tsx'), str(typecheck_root / '**' / '*.ts')]}
+    atomic_write(stage / 'tsconfig.json', canonical(tsconfig))
+    with (stage / 'build.log').open('wb') as log:
+        try:
+            run([npm, 'exec', '--no', '--', 'tsc', '--project', str(stage / 'tsconfig.json')], cwd=web, env=env, check=True, stdout=log, stderr=log, timeout=180)
+            run([npm, 'exec', '--no', '--', 'vite', 'build', '--config', 'vite.app.config.ts'], cwd=web, env=env, check=True, stdout=log, stderr=log, timeout=180)
+        except subprocess.TimeoutExpired as exc:
+            raise WebPlatformError('The installed compiler exceeded its execution deadline.') from exc
+        except subprocess.CalledProcessError as exc:
+            log.flush()
+            detail = (stage / 'build.log').read_text(encoding='utf-8', errors='replace')[-4000:]
+            if exc.returncode in {137, -9} or 'heap out of memory' in detail.lower():
+                raise WebPlatformError('The installed compiler exhausted its memory limit.') from exc
+            raise WebSourceError('web_build_failed', f'Working project did not compile.\n{detail}') from exc
+    return customization
+
+
+def build(root, runtime, custom, *, product_version=None, toolchain=None, compiler=None):
+    root, runtime, custom = admin_directory(root), admin_directory(runtime), admin_directory(custom)
+    toolchain = toolchain or require_toolchain(root)
+    source_fingerprint = custom_source_fingerprint(custom)
+    build_id = uuid.uuid4().hex
+    stage = local_path(runtime, 'staging/' + build_id, directory=True)
+    base_hash, detected_version = source_version(root)
+    product_version = detected_version if product_version is None else product_version
+    with publication_lock(runtime):
+        key, identity = signing_identity(runtime)
+    compile_source = compile_files if compiler is None else compiler
+    from web_tools.source_tree import unchanged, archive_bytes
+    from web_tools.editor_files import scan_sources
+    customization = compile_source(root, runtime, custom, stage, build_id=build_id,
+                                   instance_id=identity['instance_id'], toolchain=toolchain,
+                                   customization_version='base' if unchanged(root, scan_sources(custom)) else None)
+    if source_version(root)[0] != base_hash or custom_source_fingerprint(custom) != source_fingerprint:
+        raise ValueError('UI sources changed during compilation; rebuild before publication')
+    with publication_lock(runtime):
+        try:
+            signed, content = create_package(stage / 'files', key=key, identity=identity, product_version=product_version,
+                base_build_id=base_hash, build_id=build_id, customization_version=customization['version'],
+                requirements=customization['requirements'], core_api=customization['api'])
+        except ValueError as error:
+            raise WebSourceError('web_package_invalid', str(error),
+                                 next_action='Correct the working project metadata or reported public asset, then run web.build.') from error
+        verify_package(content, identity)
+        atomic_write(stage / 'manifest.json', canonical(signed))
+        atomic_write(stage / 'package.zip', content)
+        atomic_write(stage / 'sources.zip', archive_bytes(scan_sources(custom)))
+        write_source_provenance(stage, signed, root=root, custom=custom, declaration=customization,
+                                fingerprint=source_fingerprint)
+    return {'build_id': build_id, 'stage': str(stage), 'content_hash': signed['manifest']['content_hash'],
+            'customization_version': customization['version'], 'activated': False,
+            'working_directory': str(custom)}
